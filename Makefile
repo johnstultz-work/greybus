@@ -25,6 +25,7 @@ gb-battery-y := battery.o
 gb-loopback-y := loopback.o
 gb-es1-y := es1.o
 gb-es2-y := es2.o
+gb-audio-y := audio.o
 
 obj-m += greybus.o
 obj-m += gb-phy.o
@@ -33,6 +34,7 @@ obj-m += gb-battery.o
 obj-m += gb-loopback.o
 obj-m += gb-es1.o
 obj-m += gb-es2.o
+obj-m += gb-audio.o
 
 KERNELVER		?= $(shell uname -r)
 KERNELDIR 		?= /lib/modules/$(KERNELVER)/build
