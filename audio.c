@@ -200,12 +200,14 @@ struct gb_snd {
 	struct work_struct		work;
 	int				hwptr_done;
 	struct list_head		list;
+	spinlock_t			lock;
 };
 
 
 /* XXX needs a lock! */
 static LIST_HEAD(gb_snd_list);
 int device_count;
+static DEFINE_SPINLOCK(gb_snd_list_lock);
 
 static struct gb_snd *gb_find_snd(int bundle_id)
 {
@@ -218,34 +220,45 @@ static struct gb_snd *gb_find_snd(int bundle_id)
 
 static struct gb_snd *gb_get_snd(int bundle_id)
 {
-	struct gb_snd *snd_dev;
+	struct gb_snd *snd_dev, *ret;
+	long flags;
+
+	spin_lock_irqsave(&gb_snd_list_lock, flags);
 	snd_dev = gb_find_snd(bundle_id);
-	if(snd_dev) {
-		return snd_dev;
-	}
+	if(snd_dev)
+		goto out;
 
 	snd_dev = kzalloc(sizeof(*snd_dev), GFP_KERNEL);
 	if(!snd_dev)
-		return NULL;
+		goto out;
 
+	spin_lock_init(&snd_dev->lock);
 	snd_dev->device_count = device_count++;
 	snd_dev->gb_bundle_id = bundle_id;
 	list_add(&snd_dev->list, &gb_snd_list);
+out:
+	spin_unlock_irqrestore(&gb_snd_list_lock, flags);
 	return snd_dev;
 }
 
 static void gb_free_snd(struct gb_snd* snd)
 {
+	long flags;
+
+	spin_lock_irqsave(&gb_snd_list_lock, flags);
 	if (!snd->i2s_tx_connection &&
 			!snd->mgmt_connection) {
 		list_del(&snd->list);
+		spin_unlock_irqrestore(&gb_snd_list_lock, flags);
 		kfree(snd);
+	} else {
+		spin_unlock_irqrestore(&gb_snd_list_lock, flags);
 	}
 }
 
 
 /*********************************************************
- * timer logic
+ * timer/workqueue logic
  *********************************************************/
 
 static void snd_dev_work(struct work_struct *work)
@@ -266,9 +279,12 @@ static void snd_dev_work(struct work_struct *work)
 	address = runtime->dma_area + snd_dev->hwptr_done;
 	len = frames_to_bytes(runtime, runtime->buffer_size) - snd_dev->hwptr_done;
 	len = min(len, GB_MAX_LENGTH);
+
 	ret = gb_operation_sync(snd_dev->i2s_tx_connection, GB_I2S_DATA_TYPE_SEND_DATA,
 					address, len, NULL, 0);
+	snd_pcm_stream_lock(substream);
 	snd_dev->hwptr_done += len;
+	snd_pcm_stream_unlock(substream);
 	/* XXX - Probably need to call this less frequently */
 	snd_pcm_period_elapsed(snd_dev->substream);
 }
@@ -427,13 +443,17 @@ static int gb_pcm_open(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct gb_snd *snd_dev;
+	long flags;
 	int ret;
 
 	snd_dev = snd_soc_dai_get_drvdata(rtd->cpu_dai);
 
+	spin_lock_irqsave(&snd_dev->lock, flags);
 	runtime->private_data = snd_dev;
 	snd_dev->substream = substream;
 	ret = dummy_hrtimer_init(snd_dev);
+	spin_unlock_irqrestore(&snd_dev->lock, flags);
+
 	if (ret)
 		return ret;
 
@@ -558,6 +578,7 @@ static struct asoc_simple_card_info gb_card_info = {
 static int gb_i2s_transmitter_connection_init(struct gb_connection *connection)
 {
 	struct gb_snd *snd_dev;
+	long flags;
 	int ret;
 
 	snd_dev = gb_get_snd(connection->bundle->id);
@@ -576,11 +597,14 @@ static int gb_i2s_transmitter_connection_init(struct gb_connection *connection)
 		goto out_dai;
 	}
 
-	snd_dev->i2s_tx_connection = connection;
+	spin_lock_irqsave(&snd_dev->lock, flags);
 
+	snd_dev->i2s_tx_connection = connection;
 	snd_dev->card->dev.platform_data = &gb_card_info; /*XXX - prob should generate this dynamically*/
 	snd_dev->cpu_dai->dev.platform_data = snd_dev;
 	snd_dev->i2s_tx_connection->private = snd_dev;
+
+	spin_unlock_irqrestore(&snd_dev->lock, flags);
 
 	ret = platform_device_add(snd_dev->cpu_dai);
 	if (ret) {
@@ -592,6 +616,7 @@ static int gb_i2s_transmitter_connection_init(struct gb_connection *connection)
 		//platform_device_unregister(snd_dev->cpu_dai);
 		goto out_card;
 	}
+
 	return 0;
 
 out_card:
@@ -618,13 +643,16 @@ static void gb_i2s_transmitter_connection_exit(struct gb_connection *connection)
 static int gb_i2s_mgmt_connection_init(struct gb_connection *connection)
 {
 	struct gb_snd *snd_dev;
+	long flags;
 
 	snd_dev = gb_get_snd(connection->bundle->id);
 	if(!snd_dev)
 		return -ENOMEM;
 
+	spin_lock_irqsave(&snd_dev->lock, flags);
 	snd_dev->mgmt_connection = connection;
 	connection->private = snd_dev;
+	spin_unlock_irqrestore(&snd_dev->lock, flags);
 
 	gb_i2s_mgmt_setup(connection);
 	return 0;
